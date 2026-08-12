@@ -1,0 +1,648 @@
+diff --git i/src/backend/access/transam/timeline.c w/src/backend/access/transam/timeline.c
+index d80c8ffe0a7..dec5e609cca 100644
+--- i/src/backend/access/transam/timeline.c
++++ w/src/backend/access/transam/timeline.c
+@@ -132,6 +132,9 @@ readTimeLineHistory(TimeLineID targetTLI)
+ 		uint32		switchpoint_hi;
+ 		uint32		switchpoint_lo;
+ 		int			nfields;
++		// @czepes hash
++		uint64 		timeline_hash;
++		// @sepezc
+ 
+ 		pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_READ);
+ 		res = fgets(fline, sizeof(fline), fd);
+@@ -155,7 +158,15 @@ readTimeLineHistory(TimeLineID targetTLI)
+ 		if (*ptr == '\0' || *ptr == '#')
+ 			continue;
+ 
+-		nfields = sscanf(fline, "%u\t%X/%08X", &tli, &switchpoint_hi, &switchpoint_lo);
++		// nfields = sscanf(fline, "%u\t%X/%08X", &tli, &switchpoint_hi, &switchpoint_lo);
++		// @czepes hash
++		nfields = sscanf(fline,
++						 "%u\t%X/%08X\t%*s\t%016" PRIx64,
++						 &tli,
++						 &switchpoint_hi,
++						 &switchpoint_lo,
++						 &timeline_hash);
++		// @sepezc
+ 
+ 		if (nfields < 1)
+ 		{
+@@ -181,6 +192,9 @@ readTimeLineHistory(TimeLineID targetTLI)
+ 		entry->begin = prevend;
+ 		entry->end = ((uint64) (switchpoint_hi)) << 32 | (uint64) switchpoint_lo;
+ 		prevend = entry->end;
++		// @czepes hash
++		entry->hash = timeline_hash;
++		// @sepezc
+ 
+ 		/* Build list with newest item first */
+ 		result = lcons(entry, result);
+@@ -302,9 +316,15 @@ findNewestTimeLine(TimeLineID startTLI)
+  * emplacing a bogus file.
+  */
+ void
++// writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
++// 					 XLogRecPtr switchpoint, const char *reason)
++// @czepes hash
+ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
+-					 XLogRecPtr switchpoint, const char *reason)
++					 XLogRecPtr switchpoint, const char *reason,
++					 uint64 timeline_hash)
++// @sepezc
+ {
++	// TODO: write timeline_hash
+ 	char		path[MAXPGPATH];
+ 	char		tmppath[MAXPGPATH];
+ 	char		histfname[MAXFNAMELEN];
+@@ -399,12 +419,21 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
+ 	 * If we did have a parent file, insert an extra newline just in case the
+ 	 * parent file failed to end with one.
+ 	 */
++	// snprintf(buffer, sizeof(buffer),
++	// 		 "%s%u\t%X/%08X\t%s\n",
++	// 		 (srcfd < 0) ? "" : "\n",
++	// 		 parentTLI,
++	// 		 LSN_FORMAT_ARGS(switchpoint),
++	// 		 reason);
++	// @czepes hash
+ 	snprintf(buffer, sizeof(buffer),
+-			 "%s%u\t%X/%08X\t%s\n",
++			 "%s%u\t%X/%08X\t%s\t" TL_HASH_FORMAT "\n",
+ 			 (srcfd < 0) ? "" : "\n",
+ 			 parentTLI,
+ 			 LSN_FORMAT_ARGS(switchpoint),
+-			 reason);
++			 reason,
++			 timeline_hash);
++	// @sepezc
+ 
+ 	nbytes = strlen(buffer);
+ 	errno = 0;
+diff --git i/src/backend/access/transam/xlog.c w/src/backend/access/transam/xlog.c
+index b23d8bbbdad..4357834d092 100644
+--- i/src/backend/access/transam/xlog.c
++++ w/src/backend/access/transam/xlog.c
+@@ -110,6 +110,11 @@
+ #include "utils/varlena.h"
+ #include "utils/wait_event.h"
+ 
++// @czepes hash
++#include "access/xlogdefs.h"
++#include "common/hashfn.h"
++// @sepezc
++
+ #ifdef WAL_DEBUG
+ #include "utils/memutils.h"
+ #endif
+@@ -560,6 +565,11 @@ typedef struct XLogCtlData
+ 	uint32		data_checksum_version;
+ 
+ 	slock_t		info_lck;		/* locks shared variables shown above */
++
++	// @czepes hash
++	/* Chanined hash of current WAL segment that is updated on every WAL page write */
++	uint64		cur_seg_hash;
++	// @sepezc
+ } XLogCtlData;
+ 
+ /*
+@@ -751,6 +761,10 @@ static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+ 
+ static void XLogChecksums(uint32 new_type);
+ 
++// @czepes hash
++static bool RehashInProgressSegment(XLogSegNo segno, TimeLineID tli, Size written_bytes);
++// @sepezc
++
+ /*
+  * Insert an XLOG record represented by an already-constructed chain of data
+  * chunks.  This is a low-level routine; to construct the WAL record header
+@@ -2437,9 +2451,17 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
+ 			Size		nleft;
+ 			ssize_t		written;
+ 			instr_time	start;
++			// @czepes hash
++			char		*pages;
++			int			nhashed = 0;
++			ssize_t		to_hash = 0;
++			// @sepezc
+ 
+ 			/* OK to write the page(s) */
+ 			from = XLogCtl->pages + startidx * (Size) XLOG_BLCKSZ;
++			// @czepes
++			pages = from;
++			// @sepezc
+ 			nbytes = npages * (Size) XLOG_BLCKSZ;
+ 			nleft = nbytes;
+ 			do
+@@ -2473,6 +2495,21 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
+ 									xlogfname, startoffset, nleft)));
+ 				}
+ 
++				// @czepes hash
++				/* Update current segment's hash for each written page */
++				to_hash += written;
++				while (to_hash >= XLOG_BLCKSZ && nhashed < npages) {
++					ereport(LOG, errmsg("updating cur_seg_hash after full page write, to_hash = %zu", to_hash));
++					XLogCtl->cur_seg_hash = hash_bytes_extended(
++						(const unsigned char*) pages + nhashed * (Size) XLOG_BLCKSZ,
++						(int) XLOG_BLCKSZ,
++						XLogCtl->cur_seg_hash
++					);
++					to_hash -= XLOG_BLCKSZ;
++					nhashed++;
++				}
++				// @sepezc
++
+ 				pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL,
+ 										IOOP_WRITE, start, 1, written);
+ 				nleft -= written;
+@@ -2510,6 +2547,14 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
+ 				XLogCtl->lastSegSwitchTime = (pg_time_t) time(NULL);
+ 				XLogCtl->lastSegSwitchLSN = LogwrtResult.Flush;
+ 
++				// @czepes hash
++				/* Flush current timeline's hash to pg_control file due to the end of segment. */
++				LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
++				ControlFile->timeline_hash = XLogCtl->cur_seg_hash;
++				UpdateControlFile();
++				LWLockRelease(ControlFileLock);
++				// @sepezc
++
+ 				/*
+ 				 * Request a checkpoint if we've consumed too much xlog since
+ 				 * the last one.  For speed, we first check using the local
+@@ -4283,6 +4328,9 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
+ 	ControlFile->wal_log_hints = wal_log_hints;
+ 	ControlFile->track_commit_timestamp = track_commit_timestamp;
+ 	ControlFile->data_checksum_version = data_checksum_version;
++	// @czepes hash
++	ControlFile->timeline_hash = TIMELINE_HASH_INITIAL_SEED;
++	// @sepezc
+ 
+ 	/*
+ 	 * Set the data_checksum_version value into XLogCtl, which is where all
+@@ -5423,6 +5471,9 @@ XLOGShmemInit(void *arg)
+ 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_CRASH;
+ 	XLogCtl->InstallXLogFileSegmentActive = false;
+ 	XLogCtl->WalWriterSleeping = false;
++	// @czepes hash
++	XLogCtl->cur_seg_hash = TIMELINE_HASH_INITIAL_SEED;
++	// @sepezc
+ 
+ 	/* Use the checksum info from control file */
+ 	XLogCtl->data_checksum_version = ControlFile->data_checksum_version;
+@@ -5627,7 +5678,10 @@ str_time(pg_time_t tnow, char *buf, size_t bufsize)
+  * Initialize the first WAL segment on new timeline.
+  */
+ static void
+-XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
++// XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
++// @czepes hash
++XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI, uint64 *parent_timeline_hash)
++// @sepezc
+ {
+ 	char		xlogfname[MAXFNAMELEN];
+ 	XLogSegNo	endLogSegNo;
+@@ -5696,6 +5750,18 @@ XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
+ 	 */
+ 	XLogFileName(xlogfname, newTLI, startLogSegNo, wal_segment_size);
+ 	XLogArchiveCleanup(xlogfname);
++
++	// @czepes hash
++	/* Reset hash after timeline switch. Not sure where to put this in here yet. */
++	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
++	*parent_timeline_hash = XLogCtl->cur_seg_hash;
++
++	XLogCtl->cur_seg_hash = TIMELINE_HASH_INITIAL_SEED;
++	ControlFile->timeline_hash = TIMELINE_HASH_INITIAL_SEED;
++
++	// UpdateControlFile(); ??
++	LWLockRelease(ControlFileLock);
++	// @sepezc
+ }
+ 
+ /*
+@@ -5838,6 +5904,106 @@ CheckRequiredParameterValues(void)
+ 	}
+ }
+ 
++// @czepes hash
++/*
++ * Rebuild running timeline's hash state by reading in-progress segment
++ * page-by-page and updating cur_seg_hash with each valid (non-torn) page.
++ * Stop on first non-valid (torn) page or at the end of segment.
++ *
++ * written_bytes = number of bytes written into the segment (0, wal_segment_size]
++ *
++ * Returns true if any pages were rehashed, false if segment is empty.
++ */
++bool RehashInProgressSegment(XLogSegNo segno, TimeLineID tli, Size written_bytes)
++{
++	char		path[MAXPGPATH];
++	int			fd;
++	Size		page_offset;
++	Size		full_pages;
++	bool		hashed_any = false;
++
++	if (written_bytes == 0)
++		return false;
++
++	full_pages = written_bytes / XLOG_BLCKSZ;
++
++	if (full_pages == 0)
++		return false;
++
++	ereport(LOG,
++		 	errmsg("timeline rehash: begin rehashing for segment %X/%X of size %zu",
++		 		   (uint32) (segno >> 32),(uint32) segno, written_bytes
++		 ));
++
++	XLogFilePath(path, tli, segno, wal_segment_size);
++	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
++
++	if (fd < 0) {
++		ereport(WARNING, errmsg("timeline rehash: failed to open segment %s", path));
++		return false;
++	}
++
++	for (page_offset = 0;
++		 page_offset < full_pages * XLOG_BLCKSZ;
++		 page_offset += XLOG_BLCKSZ)
++	{
++		char			page[XLOG_BLCKSZ];
++		XLogPageHeader	header = (XLogPageHeader) page;
++		XLogRecPtr		pageaddr;
++		Size			nread;
++
++		pageaddr = segno * wal_segment_size + page_offset;
++
++		nread = read(fd, page, XLOG_BLCKSZ);
++		if (nread != XLOG_BLCKSZ)
++		{
++			ereport(LOG,
++		   			errmsg("timeline rehash: failed to read full page at "
++			   			   UINT64_FORMAT ": %zu != %zu",
++			   			   pageaddr, nread, XLOG_BLCKSZ));
++			break;
++		}
++
++		if (header->xlp_magic != XLOG_PAGE_MAGIC)
++		{
++			ereport(LOG,
++		   			errmsg("timeline rehash: magic mismatch at "
++			   			   UINT64_FORMAT ": %u != %u",
++			   			   pageaddr, header->xlp_magic, XLOG_PAGE_MAGIC));
++			break;
++		}
++
++		if (header->xlp_pageaddr != pageaddr)
++		{
++			ereport(LOG,
++		   			errmsg("timeline rehash: page address mismatch at "
++			   			   UINT64_FORMAT ": " UINT64_FORMAT " != " UINT64_FORMAT,
++			   			   pageaddr, header->xlp_pageaddr, pageaddr));
++			break;
++		}
++
++		if (header->xlp_tli != tli)
++		{
++			ereport(LOG,
++		   			errmsg("timeline rehash: skipping page from previous TLI at "
++			   			   UINT64_FORMAT ": %u != %u",
++			   			   pageaddr, header->xlp_tli, tli));
++			continue;
++		}
++
++		XLogCtl->cur_seg_hash =
++			hash_bytes_extended((const unsigned char *) page,
++								XLOG_BLCKSZ,
++								XLogCtl->cur_seg_hash);
++
++		hashed_any = true;
++	}
++
++	CloseTransientFile(fd);
++	return hashed_any;
++}
++// @sepezc
++
+ /*
+  * This must be called ONCE during postmaster or standalone-backend startup
+  */
+@@ -5860,6 +6026,9 @@ StartupXLOG(void)
+ 	TransactionId oldestActiveXID;
+ 	bool		promoted = false;
+ 	char		timebuf[128];
++	// @czepes hash
++	uint64		parent_tl_hash;
++	// @sepezc
+ 
+ 	/*
+ 	 * We should have an aux process resource owner to use, and we should not
+@@ -6288,6 +6457,42 @@ StartupXLOG(void)
+ 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
+ 	missingContrecPtr = endOfRecoveryInfo->missingContrecPtr;
+ 
++	// @czepes hash
++	/*
++	 * Restore running timeiline's hash to latest hashed segment.
++	 * Complete hash recovery are handled by RehashInProgressTimeline in StartupXLOG.
++	 */
++	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
++	XLogCtl->cur_seg_hash = ControlFile->timeline_hash;
++	LWLockRelease(ControlFileLock);
++
++	/*
++	 * Recalculate running timeline's hash for in-progress segment.
++	 * cur_seg_hash is RAM only value and was lost after shutdown,
++	 * so we restore it by reading in-progress segment from disk
++	 * and recalculating page-by-page.
++	 */
++	if (EndOfLog != InvalidXLogRecPtr)
++	{
++		XLogSegNo	end_segno;
++		Size		written_bytes;
++
++		XLByteToPrevSeg(EndOfLog, end_segno, wal_segment_size);
++		written_bytes = XLogSegmentOffset(EndOfLog, wal_segment_size);
++
++		if (!RehashInProgressSegment(end_segno, EndOfLogTLI, written_bytes)
++			&& written_bytes >= XLOG_BLCKSZ)
++		{
++			ereport(WARNING,
++					errmsg("failed to rehash any pages of "
++						   "in-progress segment %X/%X, "
++						   "hash chain may be inconsistent",
++						   (uint32) (end_segno >> 32),
++						   (uint32) end_segno));
++		}
++	}
++	// @sepezc
++
+ 	/*
+ 	 * Reset ps status display, so as no information related to recovery shows
+ 	 * up.
+@@ -6385,7 +6590,10 @@ StartupXLOG(void)
+ 		 * have a copy of the last block of the old WAL in
+ 		 * endOfRecovery->lastPage; we will use that below.)
+ 		 */
+-		XLogInitNewTimeline(EndOfLogTLI, EndOfLog, newTLI);
++		// XLogInitNewTimeline(EndOfLogTLI, EndOfLog, newTLI);
++		// @czepes hash
++		XLogInitNewTimeline(EndOfLogTLI, EndOfLog, newTLI, &parent_tl_hash);
++		// @sepezc
+ 
+ 		/*
+ 		 * Remove the signal files out of the way, so that we don't
+@@ -6407,8 +6615,13 @@ StartupXLOG(void)
+ 		 * To minimize the window for that, try to do as little as possible
+ 		 * between here and writing the end-of-recovery record.
+ 		 */
++		// writeTimeLineHistory(newTLI, recoveryTargetTLI,
++		// 					 EndOfLog, endOfRecoveryInfo->recoveryStopReason);
++		// @czepes hash
+ 		writeTimeLineHistory(newTLI, recoveryTargetTLI,
+-							 EndOfLog, endOfRecoveryInfo->recoveryStopReason);
++							 EndOfLog, endOfRecoveryInfo->recoveryStopReason,
++							 parent_tl_hash);
++		// @sepezc
+ 
+ 		ereport(LOG,
+ 				(errmsg("archive recovery complete")));
+@@ -10201,3 +10414,21 @@ SetWalWriterSleeping(bool sleeping)
+ 	XLogCtl->WalWriterSleeping = sleeping;
+ 	SpinLockRelease(&XLogCtl->info_lck);
+ }
++
++// @czepes hash
++/* Get current timeline's hash from pg_control. */
++uint64 GetCurrentTimelineHash(uint64 *cur_seg_hash)
++{
++	uint64 timeline_hash;
++
++	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
++	timeline_hash = ControlFile->timeline_hash;
++	LWLockRelease(ControlFileLock);
++
++	if (cur_seg_hash != NULL) {
++		*cur_seg_hash = XLogCtl->cur_seg_hash;
++	}
++
++	return timeline_hash;
++}
++// @sepezc
+diff --git i/src/backend/utils/misc/pg_controldata.c w/src/backend/utils/misc/pg_controldata.c
+index d229ae35209..2bdd85b4988 100644
+--- i/src/backend/utils/misc/pg_controldata.c
++++ w/src/backend/utils/misc/pg_controldata.c
+@@ -28,6 +28,10 @@
+ #include "utils/pg_lsn.h"
+ #include "utils/timestamp.h"
+ 
++// @czepes hash
++#include "access/timeline.h"
++// @sepezc
++
+ Datum
+ pg_control_system(PG_FUNCTION_ARGS)
+ {
+@@ -264,3 +268,38 @@ pg_control_init(PG_FUNCTION_ARGS)
+ 
+ 	PG_RETURN_DATUM(HeapTupleGetDatum(htup));
+ }
++
++// @czepes hash
++Datum
++pg_control_hash(PG_FUNCTION_ARGS)
++{
++	Datum		values[2];
++	bool		nulls[2];
++	TupleDesc	tupdesc;
++	HeapTuple	htup;
++	uint64		timeline_hash;
++	uint64		cur_seg_hash;
++	char		hexbuf[16 + 1];
++
++	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
++		elog(ERROR, "return type must be a row type");
++
++	timeline_hash = GetCurrentTimelineHash(&cur_seg_hash);
++
++	snprintf(hexbuf, sizeof(hexbuf),
++			 TL_HASH_FORMAT,
++			 timeline_hash);
++	values[0] = CStringGetTextDatum(hexbuf);
++	nulls[0] = false;
++
++	snprintf(hexbuf, sizeof(hexbuf),
++			 TL_HASH_FORMAT,
++			 cur_seg_hash);
++	values[1] = CStringGetTextDatum(hexbuf);
++	nulls[1] = false;
++
++	htup = heap_form_tuple(tupdesc, values, nulls);
++
++	PG_RETURN_DATUM(HeapTupleGetDatum(htup));
++}
++// @sepezc
+diff --git i/src/bin/pg_rewind/timeline.c w/src/bin/pg_rewind/timeline.c
+index dda06eaa0bc..468be5e4290 100644
+--- i/src/bin/pg_rewind/timeline.c
++++ w/src/bin/pg_rewind/timeline.c
+@@ -48,6 +48,9 @@ rewind_parseTimeLineHistory(char *buffer, TimeLineID targetTLI, int *nentries)
+ 		uint32		switchpoint_hi;
+ 		uint32		switchpoint_lo;
+ 		int			nfields;
++		// @czepes hash
++		uint64 		timeline_hash;
++		// @sepezc
+ 
+ 		fline = bufptr;
+ 		while (*bufptr && *bufptr != '\n')
+@@ -66,7 +69,15 @@ rewind_parseTimeLineHistory(char *buffer, TimeLineID targetTLI, int *nentries)
+ 		if (*ptr == '\0' || *ptr == '#')
+ 			continue;
+ 
+-		nfields = sscanf(fline, "%u\t%X/%08X", &tli, &switchpoint_hi, &switchpoint_lo);
++		// nfields = sscanf(fline, "%u\t%X/%08X", &tli, &switchpoint_hi, &switchpoint_lo);
++		// @czepes hash
++		nfields = sscanf(fline,
++						 "%u\t%X/%08X\t%*s\t" TL_HASH_FORMAT,
++						 &tli,
++						 &switchpoint_hi,
++						 &switchpoint_lo,
++						 &timeline_hash);
++		// @sepezc
+ 
+ 		if (nfields < 1)
+ 		{
+@@ -98,6 +109,9 @@ rewind_parseTimeLineHistory(char *buffer, TimeLineID targetTLI, int *nentries)
+ 		entry->begin = prevend;
+ 		entry->end = ((uint64) (switchpoint_hi)) << 32 | (uint64) switchpoint_lo;
+ 		prevend = entry->end;
++		// @czepes hash
++		entry->hash = timeline_hash;
++		// @sepezc
+ 
+ 		/* we ignore the remainder of each line */
+ 	}
+diff --git i/src/include/access/timeline.h w/src/include/access/timeline.h
+index 3aee3419a5c..ed9ea7328f3 100644
+--- i/src/include/access/timeline.h
++++ w/src/include/access/timeline.h
+@@ -27,13 +27,21 @@ typedef struct
+ 	TimeLineID	tli;
+ 	XLogRecPtr	begin;			/* inclusive */
+ 	XLogRecPtr	end;			/* exclusive, InvalidXLogRecPtr means infinity */
++	// @czepes hash
++	uint64 		hash;			/* hash of TLI's last completed segment at switchpoint */
++	// @sepezc
+ } TimeLineHistoryEntry;
+ 
+ extern List *readTimeLineHistory(TimeLineID targetTLI);
+ extern bool existsTimeLineHistory(TimeLineID probeTLI);
+ extern TimeLineID findNewestTimeLine(TimeLineID startTLI);
++// extern void writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
++// 								 XLogRecPtr switchpoint, const char *reason);
++// @czepes hash
+ extern void writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
+-								 XLogRecPtr switchpoint, const char *reason);
++								 XLogRecPtr switchpoint, const char *reason,
++								 uint64 timeline_hash);
++// @sepezc
+ extern void writeTimeLineHistoryFile(TimeLineID tli, const char *content, size_t size);
+ extern void restoreTimeLineHistoryFiles(TimeLineID begin, TimeLineID end);
+ extern bool tliInHistory(TimeLineID tli, List *expectedTLEs);
+diff --git i/src/include/access/xlog.h w/src/include/access/xlog.h
+index 4dd98624204..33dd2bf1a7b 100644
+--- i/src/include/access/xlog.h
++++ w/src/include/access/xlog.h
+@@ -13,6 +13,7 @@
+ 
+ #include "access/xlogbackup.h"
+ #include "access/xlogdefs.h"
++#include "c.h"
+ #include "replication/logicalctl.h"
+ #include "datatype/timestamp.h"
+ #include "lib/stringinfo.h"
+@@ -289,6 +290,10 @@ extern void WakeupCheckpointer(void);
+ extern Size WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
+ 							   TimeLineID tli);
+ 
++// @czepes hash
++extern uint64 GetCurrentTimelineHash(uint64 *cur_seg_hash);
++// @sepezc
++
+ /*
+  * Routines used by xlogrecovery.c to call back into xlog.c during recovery.
+  */
+diff --git i/src/include/c.h w/src/include/c.h
+index 20cfbac54e7..feb74ffecf4 100644
+--- i/src/include/c.h
++++ w/src/include/c.h
+@@ -694,6 +694,10 @@ typedef uint64_t uint64;
+ #define UINT64_FORMAT "%" PRIu64
+ #define OID8_FORMAT "%" PRIu64
+ 
++// @czepes hash
++#define TL_HASH_FORMAT "%016" PRIx64
++// @sepezc
++
+ /*
+  * 128-bit signed and unsigned integers
+  *		There currently is only limited support for such types.
+diff --git i/src/include/catalog/pg_control.h w/src/include/catalog/pg_control.h
+index 80b3a730e03..936b1a0d866 100644
+--- i/src/include/catalog/pg_control.h
++++ w/src/include/catalog/pg_control.h
+@@ -22,7 +22,11 @@
+ 
+ 
+ /* Version identifier for this pg_control format */
+-#define PG_CONTROL_VERSION	1902
++// #define PG_CONTROL_VERSION	1902
++// @czepes hash
++#define PG_CONTROL_VERSION	1903
++#define TIMELINE_HASH_INITIAL_SEED	UINT64CONST(0)
++// sepezc@
+ 
+ /* Nonce key length, see below */
+ #define MOCK_AUTH_NONCE_LEN		32
+@@ -244,6 +248,14 @@ typedef struct ControlFileData
+ 	 */
+ 	char		mock_authentication_nonce[MOCK_AUTH_NONCE_LEN];
+ 
++	// @czepes hash
++	/*
++	 * Chained hash of completed WAL segments in current timeline.
++	 * It is reset after timeline switch.
++	 */
++	uint64		timeline_hash;
++	// sepezc@
++
+ 	/* CRC of all above ... MUST BE LAST! */
+ 	pg_crc32c	crc;
+ } ControlFileData;
+diff --git i/src/include/catalog/pg_proc.dat w/src/include/catalog/pg_proc.dat
+index f8a021987b5..5d76ce13606 100644
+--- i/src/include/catalog/pg_proc.dat
++++ w/src/include/catalog/pg_proc.dat
+@@ -12393,6 +12393,15 @@
+   proargnames => '{max_data_alignment,database_block_size,blocks_per_segment,wal_block_size,bytes_per_wal_segment,max_identifier_length,max_index_columns,max_toast_chunk_size,large_object_chunk_size,float8_pass_by_value,data_page_checksum_version,default_char_signedness}',
+   prosrc => 'pg_control_init' },
+ 
++{ oid => '9286',
++  descr => 'pg_controldata hash state information as a function',
++  proname => 'pg_control_hash', provolatile => 'v', prorettype => 'record',
++  proargtypes => '',
++  proallargtypes => '{text,text}',
++  proargmodes => '{o,o}',
++  proargnames => '{timeline_hash,cur_seg_hash}',
++  prosrc => 'pg_control_hash' },
++
+ # subscripting support for built-in types
+ { oid => '6179', descr => 'standard array subscripting support',
+   proname => 'array_subscript_handler',
