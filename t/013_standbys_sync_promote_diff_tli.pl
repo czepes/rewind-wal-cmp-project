@@ -51,8 +51,8 @@ is(
 );
 
 # Make sure that Standby nodes have identical TLI 2 begin LSN
-my $standby_lsn = $node_standby->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
-my $standby_2_lsn = $node_standby_2->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+my $standby_lsn = $node_standby->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+my $standby_2_lsn = $node_standby_2->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
 is($standby_2_lsn, $standby_lsn, 'divergent TLI 2 branches begin at the same LSN');
 
 # The INSERTs have identical WAL sizes (and LSN) but distinct contents on TLI 2 branches
